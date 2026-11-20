@@ -1,0 +1,98 @@
+<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>UEEE · Grabadora segura</title><style>
+*{box-sizing:border-box}body{font:15px Arial,sans-serif;margin:0;background:#eef3f7;color:#183348}header{background:#123e5e;color:white;padding:22px}main{max-width:930px;margin:22px auto;padding:0 16px}.card{background:white;padding:20px;border-radius:14px;border:1px solid #dbe4eb;margin-bottom:15px}h1{font-size:22px;margin:0}h2{font-size:18px;margin:0 0 15px}button{padding:12px 17px;border:0;background:#136d99;color:white;border-radius:8px;cursor:pointer;font-weight:bold;margin:4px}button:disabled{opacity:.45}button.alt{background:#e2eaf1;color:#173b57}button.red{background:#a73a34}.status{background:#edf4fa;border-radius:8px;padding:12px;white-space:pre-wrap;margin:12px 0}.warn{color:#ae4e1b;font-size:13px}.muted{color:#62768a;font-size:13px}.active{color:#087d55}.error{color:#ad2b2b}#log{max-height:210px;overflow:auto;font:12px monospace;background:#f7f9fb;padding:10px;border-radius:7px}#partial{font-style:italic;color:#677888}.row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}.metric{display:inline-block;margin:8px;background:#e9f1f5;padding:9px;border-radius:8px}input{padding:10px;border:1px solid #c4cfd9;border-radius:7px;width:100%}</style></head><body>
+<header><h1>🎙️ UEEE — Grabadora de sesiones</h1><p>Audio segmentado + transcripción en tiempo real (cuando el navegador lo permita)</p></header><main>
+<div class="card"><h2>Conexión y consentimiento</h2><div id="connection" class="status">Intentando conectar con la aplicación de Apps Script...</div><div id="sessionTitle" class="muted"></div>
+<p class="warn">Solicite el consentimiento y confirme la política institucional antes de iniciar. Esta grabadora guarda temporalmente en este navegador segmentos pendientes y envía los audios a Drive a través del panel institucional. No cierre ambas ventanas hasta confirmar que todos los segmentos se guardaron.</p></div>
+<div class="card"><h2>Control de grabación</h2><div class="row"><button id="start" onclick="startRecord()" disabled>▶ Iniciar grabación</button><button id="stop" class="red" onclick="stopRecord()" disabled>■ Detener</button><button id="retry" class="alt" onclick="retryAll()" disabled>↻ Reintentar pendientes</button><button id="sync" class="alt" onclick="sendAllTranscripts()" disabled>Sincronizar texto</button></div>
+<div class="row"><div class="metric">Audio: <b id="audioState">detenido</b></div><div class="metric">Reconocimiento: <b id="speechState">inactivo</b></div><div class="metric">Pendientes locales: <b id="pending">0</b></div><div class="metric">Tiempo: <b id="elapsed">00:00:00</b></div></div>
+<div class="status" id="status">El audio original se prioriza sobre el reconocimiento de voz.</div>
+<p class="warn">La transcripción en vivo puede dejar huecos cuando se interrumpe el reconocimiento. El audio sigue grabándose de forma independiente. Los segmentos pueden tener breves discontinuidades por reinicio del codificador.</p>
+</div>
+<div class="card"><h2>Texto reconocido en vivo</h2><p class="muted">Reconocimiento del navegador (español Ecuador). Este texto debe cotejarse con el audio antes de marcarlo como literal.</p><div id="partial">Esperando voz...</div><div id="log"></div></div>
+<div class="card"><h2>Respaldo de emergencia</h2><p class="muted">Si falla la comunicación con Drive, el audio pendiente permanece en IndexedDB del navegador (en este dispositivo y perfil). No borre los datos del sitio. También puede descargar cada clip pendiente.</p><div id="downloads"></div></div>
+</main><script>
+'use strict';
+const APP='UEEE_RECORDER_V2',DASH='UEEE_DASH_V2', DB='ueee_recorder_v2';
+const $=x=>document.getElementById(x);
+let sessionId='', sessionTitle='', senderOrigin='',db=null,stream=null,recorder=null,recTimer=null,elapsedTimer=null,recording=false,startTime=0,recognition=null,speechEnabled=false,forceSpeechStop=false,speechTimer=null,segmentIndex=0,chunkQueue=[],sending=false,waitingAck=null,retryTimer=null,pendingCount=0;
+const sleep=n=>new Promise(r=>setTimeout(r,n));
+const log=(s,err=false)=>{$('status').textContent=s;$('status').className='status '+(err?'error':'active')};
+const connectStatus=s=>{$('connection').textContent=s};
+function send(type,payload={}){if(!window.opener||window.opener.closed||!senderOrigin)return;window.opener.postMessage({app:APP,type,sessionId,...payload},senderOrigin)}
+function ready(){if(window.opener&&!window.opener.closed){window.opener.postMessage({app:APP,type:'READY'},'*');connectStatus('Solicitando conexión segura al panel...')}else{connectStatus('Abra esta grabadora desde el botón del panel de Apps Script. Esta ventana necesita estar vinculada al panel.')}}
+window.addEventListener('message',async e=>{const m=e.data||{};if(m.app!==DASH||e.source!==window.opener)return;
+ if(m.type==='CONNECT'){
+  if(sessionId&&sessionId!==m.sessionId&&recording)return log('No se permite cambiar la sesión mientras se graba.',true);
+  senderOrigin=e.origin;sessionId=m.sessionId;sessionTitle=m.sessionTitle||'';
+  if(!/^[a-f0-9-]{36}$/.test(sessionId))return log('ID de sesión inválido',true);
+  $('sessionTitle').textContent='Sesión: '+sessionTitle+' · '+sessionId;
+  $('start').disabled=false;$('retry').disabled=false;$('sync').disabled=false;
+  connectStatus('Conectado al panel institucional. Puede comenzar.');
+  await initSession();sendAllTranscripts();retryAll();
+ }
+ if(m.type==='ACK'&&m.sessionId===sessionId){
+  if(waitingAck&&waitingAck.index===m.index){clearTimeout(waitingAck.timer);waitingAck.resolve(true);waitingAck=null;}
+ }
+ if(m.type==='NACK'&&m.sessionId===sessionId){
+  if(waitingAck&&waitingAck.index===m.index){clearTimeout(waitingAck.timer);waitingAck.reject(Error(m.error||'Error al guardar'));waitingAck=null;}
+ }
+});
+function openDB(){return new Promise((resolve,reject)=>{
+ const req=indexedDB.open(DB,1);req.onupgradeneeded=()=>{const d=req.result;if(!d.objectStoreNames.contains('audio'))d.createObjectStore('audio',{keyPath:'key'});if(!d.objectStoreNames.contains('text'))d.createObjectStore('text',{keyPath:'key'});if(!d.objectStoreNames.contains('settings'))d.createObjectStore('settings',{keyPath:'key'})};req.onsuccess=()=>resolve(req.result);req.onerror=()=>reject(req.error);
+})}
+function txn(store,mode,fn){return new Promise((resolve,reject)=>{const t=db.transaction(store,mode);const s=t.objectStore(store),req=fn(s);let result;t.oncomplete=()=>resolve(result);t.onerror=()=>reject(t.error);if(req){req.onsuccess=()=>result=req.result;req.onerror=()=>reject(req.error)}})}
+const put=(store,obj)=>txn(store,'readwrite',s=>s.put(obj));
+const del=(store,key)=>txn(store,'readwrite',s=>s.delete(key));
+const get=(store,key)=>txn(store,'readonly',s=>s.get(key));
+const all=store=>txn(store,'readonly',s=>s.getAll());
+async function initSession(){if(!db)db=await openDB();const index=await get('settings',sessionId+'_next_index');segmentIndex=Number(index?.value||0);await updatePending()}
+async function nextIndex(){segmentIndex++;await put('settings',{key:sessionId+'_next_index',value:segmentIndex});return segmentIndex}
+async function updatePending(){if(!db||!sessionId)return;const clips=(await all('audio')).filter(x=>x.session===sessionId);pendingCount=clips.length;$('pending').textContent=pendingCount;renderDownloads(clips)}
+function renderDownloads(clips){$('downloads').innerHTML='';if(!clips.length){$('downloads').textContent='Todos los clips conocidos están confirmados por Drive.';return}for(const c of clips){const btn=document.createElement('button');btn.className='alt';btn.textContent='Descargar clip '+c.index;btn.onclick=()=>{const u=URL.createObjectURL(c.blob);const a=document.createElement('a');a.href=u;a.download='UEEE_'+sessionId.slice(0,8)+'_'+String(c.index).padStart(6,'0')+(c.mime==='audio/mp4'?'.m4a':c.mime==='audio/ogg'?'.ogg':'.webm');a.click();setTimeout(()=>URL.revokeObjectURL(u),60000)};$('downloads').append(btn)}}
+function chooseMime(){for(const m of ['audio/webm;codecs=opus','audio/webm','audio/mp4','audio/ogg'])if(MediaRecorder.isTypeSupported(m))return m;return ''}
+async function startRecord(){if(recording)return;if(!sessionId)return log('No está conectado al panel.',true);if(!navigator.mediaDevices?.getUserMedia||!window.MediaRecorder)return log('El navegador no permite grabar desde esta página. Use Chrome/Edge actualizado en HTTPS.',true);
+ try{stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true},video:false});recording=true;$('start').disabled=true;$('stop').disabled=false;startTime=Date.now();elapsedTimer=setInterval(()=>{const t=Math.floor((Date.now()-startTime)/1000);$('elapsed').textContent=[Math.floor(t/3600),Math.floor(t/60)%60,t%60].map(x=>String(x).padStart(2,'0')).join(':')},1000);$('audioState').textContent='grabando';log('Grabación activa. Cada segmento se respalda localmente antes de enviarse a Drive.');send('STATUS',{recording:true,speech:'iniciando'});recordNext();startSpeech();}
+ catch(e){log('No se pudo acceder al micrófono: '+e.message,true)}}
+function recordNext(){if(!recording||!stream||!stream.active)return;const mime=chooseMime();const options=mime?{mimeType:mime,audioBitsPerSecond:48000}:{audioBitsPerSecond:48000};
+ try{recorder=new MediaRecorder(stream,options);}catch(e){log('MediaRecorder falló: '+e.message,true);stopRecord();return}
+ const pieces=[];recorder.ondataavailable=e=>{if(e.data.size)pieces.push(e.data)};
+ recorder.onerror=e=>log('Error de codificación de audio: '+(e.error?.message||'desconocido'),true);
+ recorder.onstop=async()=>{
+  clearTimeout(recTimer);const blob=new Blob(pieces,{type:recorder?.mimeType||mime||'audio/webm'});const realMime=blob.type.startsWith('audio/mp4')?'audio/mp4':blob.type.startsWith('audio/ogg')?'audio/ogg':'audio/webm';
+  if(blob.size){try{const index=await nextIndex();await put('audio',{key:sessionId+'_'+index,session:sessionId,index,blob,mime:realMime,created:Date.now()});await updatePending();queueSync()}catch(e){log('¡No se pudo respaldar el segmento localmente! '+e.message,true)}}
+  if(recording)recordNext();
+ };
+ try{recorder.start();recTimer=setTimeout(()=>{if(recorder&&recorder.state==='recording')recorder.stop()},12000)}catch(e){log('No se inició segmento: '+e.message,true);stopRecord()}
+}
+async function stopRecord(){recording=false;clearTimeout(recTimer);clearInterval(elapsedTimer);$('start').disabled=false;$('stop').disabled=true;$('audioState').textContent='detenido';forceSpeechStop=true;clearTimeout(speechTimer);try{recognition?.stop()}catch(e){}if(recorder&&recorder.state!=='inactive')recorder.stop();stream?.getTracks().forEach(t=>t.stop());send('STATUS',{recording:false,speech:'inactivo'});log('Grabación detenida. Espere la confirmación de subida de todos los segmentos.');queueSync()}
+function startSpeech(){const Speech=window.SpeechRecognition||window.webkitSpeechRecognition;if(!Speech){$('speechState').textContent='no disponible';send('STATUS',{recording:true,speech:'no disponible'});return}
+ forceSpeechStop=false;speechEnabled=true;
+ function launch(){if(!recording||forceSpeechStop)return;try{recognition=new Speech();recognition.lang='es-EC';recognition.continuous=true;recognition.interimResults=true;
+  recognition.onresult=async ev=>{for(let i=ev.resultIndex;i<ev.results.length;i++){const item=ev.results[i];const text=item[0]?.transcript?.trim()||'';if(!text)continue;
+    if(item.isFinal){$('partial').textContent='';const entry={id:crypto.randomUUID?crypto.randomUUID():String(Date.now())+Math.random(),time:new Date().toLocaleString('es-EC',{hour12:false}),speaker:'Sin identificar',text,verified:false};
+     try{await put('text',{key:sessionId+'_'+entry.id,session:sessionId,entry});appendLog(entry);send('TRANSCRIPT',{entry})}catch(e){log('No pudo almacenarse una intervención: '+e.message,true)}
+    }else $('partial').textContent='Escuchando: '+text;
+  }};
+  recognition.onerror=e=>{const problem=e.error||'desconocido';$('speechState').textContent='error: '+problem;if(['not-allowed','service-not-allowed','audio-capture'].includes(problem)){forceSpeechStop=true;speechEnabled=false;log('Reconocimiento deshabilitado: '+problem+'. El audio continúa grabándose.',true)}else log('Reconocimiento interrumpido ('+problem+'). Audio continúa.');};
+  recognition.onend=()=>{if(recording&&!forceSpeechStop){$('speechState').textContent='reconectando';speechTimer=setTimeout(launch,1300)}};
+  recognition.start();$('speechState').textContent='activo';send('STATUS',{recording:true,speech:'activo'});
+ }catch(e){$('speechState').textContent='temporalmente no disponible';if(recording)speechTimer=setTimeout(launch,3000)}}launch();
+}
+function appendLog(x){const d=document.createElement('div');d.textContent='['+x.time+'] '+x.text;$('log').append(d);$('log').scrollTop=$('log').scrollHeight}
+async function sendAllTranscripts(){if(!db||!sessionId)return;const text=(await all('text')).filter(x=>x.session===sessionId).map(x=>x.entry);send('TRANSCRIPTS',{entries:text});log(text.length+' intervenciones locales enviadas al panel para sincronizar con Drive.');}
+async function blobB64(blob){const buffer=await blob.arrayBuffer();let binary='';const bytes=new Uint8Array(buffer);for(let i=0;i<bytes.length;i+=16384){binary+=String.fromCharCode(...bytes.subarray(i,i+16384))}return btoa(binary)}
+async function retryAll(){await updatePending();queueSync()}
+function queueSync(){if(sending||!sessionId||!senderOrigin)return;sending=true;(async()=>{try{
+ const clips=(await all('audio')).filter(x=>x.session===sessionId).sort((a,b)=>a.index-b.index);
+ for(const item of clips){if(!window.opener||window.opener.closed){log('Panel cerrado: los audios pendientes siguen guardados localmente.',true);break}
+  if(item.blob.size>1300000){log('Clip '+item.index+' supera el tamaño de transferencia. Descárguelo manualmente y guárdelo en Drive.',true);continue}
+  try{const base64=await blobB64(item.blob);
+   await new Promise((resolve,reject)=>{const timer=setTimeout(()=>{waitingAck=null;reject(Error('Sin respuesta de Apps Script'))},45000);waitingAck={index:item.index,resolve,reject,timer};send('AUDIO',{index:item.index,mime:item.mime,base64});});
+   await del('audio',item.key);await updatePending();log('Clip '+item.index+' confirmado en Drive.');
+  }catch(e){log('Clip '+item.index+' sigue en respaldo local: '+e.message,true);break}
+ }
+ }catch(e){log('Error de sincronización: '+e.message,true)}finally{sending=false;await updatePending()}})()}
+window.addEventListener('beforeunload',e=>{if(recording||pendingCount>0){e.preventDefault();e.returnValue='Hay grabación o segmentos pendientes.'}});
+window.addEventListener('pagehide',()=>{try{stream?.getTracks().forEach(t=>t.stop())}catch(e){}});
+ready();setInterval(()=>{if(senderOrigin&&!recording&&pendingCount>0)queueSync()},25000);
+</script></body></html>
